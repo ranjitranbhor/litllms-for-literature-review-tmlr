@@ -14,15 +14,18 @@ import os
 import re
 import argparse
 import requests
-import openai
+from openai import OpenAI
 from typing import Any
 import datetime
 import pandas as pd
-from evaluate import load
+import jiwer
 
-# Set openai credentials
-openai.api_key = os.environ.get("OPENAI_API_KEY")
+# Set openai credentials (reads OPENAI_API_KEY from the environment)
+openai_client = None
 S2_API_KEY = os.getenv('S2_API_KEY')
+S2_HEADERS = {'X-API-KEY': S2_API_KEY} if S2_API_KEY else {}
+S2_FIELDS = 'title,url,abstract,citationCount,journal,isOpenAccess,fieldsOfStudy,year,publicationDate'
+CUR_DIR = pathlib.Path(__file__).parent.resolve()
 # result_limit = 8
 
 
@@ -75,7 +78,7 @@ custom_html = "<div style='text-align: left;'>Examples:</div>"
 
 
 title_markdown = ("""
-<h1 align="center"><a href=""><img src="/file=resources/download.png", alt="Writing Assistant - LitGen" border="0" style="margin: 0 auto; height: 50px;" /></a> </h1>
+<h1 align="center"><a href=""><img src="/gradio_api/file=""" + str(CUR_DIR / 'resources' / 'download.png') + """", alt="Writing Assistant - LitGen" border="0" style="margin: 0 auto; height: 50px;" /></a> </h1>
 <h2 align="center">ReviewGPT - Literature review generation for research idea</h2>
 """)
 # <h5 align="center"> If you like our project, please give us a star ✨ on Github for latest update.  </h2>
@@ -163,7 +166,10 @@ def run_open_ai_api(json_data, model_name="gpt-4", max_tokens: int = 500, temper
     :return:
     """
 
-    completion = openai.ChatCompletion.create(
+    global openai_client
+    if openai_client is None:
+        openai_client = OpenAI()
+    completion = openai_client.chat.completions.create(
         model=model_name,
         max_tokens=max_tokens,
         temperature=temperature,
@@ -178,63 +184,129 @@ def run_open_ai_api(json_data, model_name="gpt-4", max_tokens: int = 500, temper
     #     if len(chunk['choices'][0]['delta']) != 0:
     #         partial_message = partial_message + chunk['choices'][0]['delta']['content']
     #         yield partial_message
-    return completion["choices"][0]["message"]["content"]
+    return completion.choices[0].message.content
 
 
 
-def format_results_into_markdown(recommendations):
+def format_results_into_markdown(recommendations, date_note=""):
     comment = "The following papers were found by the Semantic Scholar API \n\n"
+    if date_note:
+        comment += f"_{date_note}_\n\n"
     for index, r in enumerate(recommendations):
         # hub_paper_url = f"https://huggingface.co/papers/{r['externalIds']['ArXiv']}"
         # comment += f"* [{r['title']}]({hub_paper_url}) ({r['year']})\n"
-        comment += f"[{index+1}] [{r['title']}]({r['url']}) ({r['year']}) Cited by {r['citationCount']}\n"
+        date = r.get('publicationDate') or r.get('year')
+        comment += f"[{index+1}] [{r['title']}]({r['url']}) ({date}) Cited by {r['citationCount']}\n\n"
     return comment
 
-def find_basis_paper(query, num_papers_api=20):
-    fields = 'title,url,abstract,citationCount,journal,isOpenAccess,fieldsOfStudy,year,journal'
-    rsp = requests.get('https://api.semanticscholar.org/graph/v1/paper/search',
-                        headers={'X-API-KEY': S2_API_KEY},
-                           params={'query': query, 'limit': num_papers_api, 'fields': fields})
+def s2_request(method, url, retries=4, **kwargs):
+    """Call the S2 API, backing off on rate limits (HTTP 429)."""
+    for attempt in range(retries):
+        rsp = requests.request(method, url, headers=S2_HEADERS, timeout=30, **kwargs)
+        if rsp.status_code != 429:
+            break
+        time.sleep(2 ** (attempt + 1))
     rsp.raise_for_status()
-    results = rsp.json()
+    return rsp.json()
+
+
+DATE_PATTERN = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
+
+
+def parse_date_range(start_date, end_date):
+    """
+    Validates the optional date range. Dates may be YYYY, YYYY-MM or YYYY-MM-DD.
+    Returns (start, end, s2_filter) where s2_filter is the S2 `publicationDateOrYear`
+    value (e.g. "2020-01-01:2023-06-30", "2021:" or ":2019-12"), or None if no range.
+    """
+    start = (start_date or "").strip()
+    end = (end_date or "").strip()
+    for value in (start, end):
+        if value and not DATE_PATTERN.match(value):
+            raise ValueError(f"Invalid date '{value}'. Use YYYY, YYYY-MM or YYYY-MM-DD.")
+    if start and end and _date_bound(start, upper=False) > _date_bound(end, upper=True):
+        raise ValueError(f"Start date {start} is after end date {end}.")
+    if not start and not end:
+        return start, end, None
+    return start, end, f"{start}:{end}"
+
+
+def _date_bound(value, upper):
+    """Expands YYYY / YYYY-MM to the first (or last) day of that period, as YYYY-MM-DD."""
+    parts = value.split("-")
+    if len(parts) == 3:
+        return value
+    if len(parts) == 2:
+        return f"{value}-31" if upper else f"{value}-01"
+    return f"{value}-12-31" if upper else f"{value}-01-01"
+
+
+def paper_in_date_range(paper, start, end):
+    """Client-side filter used where the S2 API has no date parameter (recommendations)."""
+    date = paper.get("publicationDate") or (str(paper["year"]) if paper.get("year") else None)
+    if not date:
+        return False
+    # Compare at the precision the paper provides (a year-only paper matches if its year overlaps)
+    if start and date < _date_bound(start, upper=False)[:len(date)]:
+        return False
+    if end and date > _date_bound(end, upper=True)[:len(date)]:
+        return False
+    return True
+
+
+def describe_date_range(start, end):
+    if start and end:
+        return f"Published between {start} and {end}"
+    if start:
+        return f"Published on or after {start}"
+    if end:
+        return f"Published on or before {end}"
+    return ""
+
+
+def find_basis_paper(query, num_papers_api=20, date_filter=None):
+    params = {'query': query, 'limit': num_papers_api, 'fields': S2_FIELDS}
+    if date_filter:
+        params['publicationDateOrYear'] = date_filter
+    results = s2_request('GET', 'https://api.semanticscholar.org/graph/v1/paper/search', params=params)
     total = results["total"]
     if not total:
         print('No matches found. Please try another query.')
 
     print(f'Found {total} results. Showing up to {num_papers_api}.')
-    papers = results['data']
+    papers = results.get('data', [])
     # df = pd.DataFrame(papers)
     return papers #[:result_limit]
 
-def get_recommendations_from_semantic_scholar(url: str, num_papers_api=20):
+def get_recommendations_from_semantic_scholar(url: str, num_papers_api=20, start="", end=""):
     """
     https://www.semanticscholar.org/product/api/tutorial
+    The recommendations endpoint has no date parameter, so when a date range is set
+    we fetch a larger pool and filter it locally.
     """
-    fields = 'title,url,abstract,citationCount,journal,isOpenAccess,fieldsOfStudy,year,journal'
     arxiv_id = parse_arxiv_id_from_paper_url(url)
     query_id = f"ArXiv:{arxiv_id}"
+    limit = 500 if (start or end) else num_papers_api
 
-    rsp = requests.post(
+    results = s2_request(
+            'POST',
             "https://api.semanticscholar.org/recommendations/v1/papers/",
             json={
                 "positivePaperIds": [query_id],
             },
-            params={"fields": fields, "limit": num_papers_api},
+            params={"fields": S2_FIELDS, "limit": limit},
         )
-
-    results = rsp.json()
-    papers = results['recommendedPapers']
+    papers = results.get('recommendedPapers', [])
+    if start or end:
+        papers = [p for p in papers if paper_in_date_range(p, start, end)][:num_papers_api]
     return papers
 
 def get_paper_data(paper_url):
     """
     Retrieves data of one paper based on URL
     """
-    fields = 'title,url,abstract,citationCount,journal,isOpenAccess,fieldsOfStudy,year,journal'
-    rsp = requests.get(f"https://api.semanticscholar.org/graph/v1/paper/URL:{paper_url}",
-                       headers={'X-API-KEY': S2_API_KEY},
-                       params={'fields': fields})
-    results = rsp.json()
+    results = s2_request('GET', f"https://api.semanticscholar.org/graph/v1/paper/URL:{paper_url}",
+                         params={'fields': S2_FIELDS})
     return results
 
 
@@ -251,8 +323,8 @@ def sort_papers(papers, sort_by):
     return papers_list
 
 
-def get_markdown_query_text(papers):
-    display_markdown = format_results_into_markdown(papers)
+def get_markdown_query_text(papers, date_note=""):
+    display_markdown = format_results_into_markdown(papers, date_note)
     cite_text = format_abstracts_as_references(papers)
     return display_markdown, cite_text
 
@@ -280,7 +352,7 @@ def format_abstracts_as_references(papers):
     for index, paper in enumerate(papers):
         # citation = f"@cite_{index+1}"
         citation = f"{index+1}"
-        cite_text = f"{cite_text}[{citation}]: {paper['abstract']}\n"
+        cite_text = f"{cite_text}[{citation}]: {paper.get('abstract') or paper.get('title')}\n"
     return cite_text
 
 def format_prompt(base_prompt, abstract, cite_text, plan=""):
@@ -298,15 +370,16 @@ def get_complete_prompt_for_summarization(base_prompt, data):
     complete_prompt = f"{base_prompt}\n```Abstract: {data}```"
     return complete_prompt
 
-def check_matching_paper(wer, abstract, papers, check_papers: int =3, wer_threshold = 0.12):
+def check_matching_paper(abstract, papers, check_papers: int =3, wer_threshold = 0.12):
     """
     Check if the user put the abstract of already existing paper and it is in the retrieved papers. 
     Using Word error rate as the metric on the top check_papers
     """
-    references = [abstract]
-    for i in range(check_papers):
-        predictions = [papers[i]['abstract']]
-        wer_score = wer.compute(predictions=predictions, references=references)
+    for i in range(min(check_papers, len(papers))):
+        prediction = papers[i].get('abstract')
+        if not prediction:
+            continue
+        wer_score = jiwer.wer(abstract, prediction)
         if wer_score < wer_threshold:
             papers.pop(i)
             return papers
@@ -327,19 +400,26 @@ class GradioChatApp:
         self.sample_plan = self.prompts["plan"]
         self.summarization_prompt = self.prompts["summarization_template"]
         self.ranking_prompt = self.prompts["ranking_template"]
-        self.wer = load("wer")
 
-    def add_text(self, history, text, complete_prompt, base_paper_textbox, keyword_textbox, rerank: bool = True, 
-                 num_papers: int = 3, model_name="gpt-4", sort_by="relevance", temperature = 0.2, max_tokens = 300, num_papers_api: int = 20):
+    def add_text(self, history, text, plan_textbox, base_paper_textbox, keyword_textbox, rerank: bool = True, 
+                 num_papers: int = 3, model_name="gpt-4", sort_by="relevance", temperature = 0.2, max_tokens = 300,
+                 start_date="", end_date="", num_papers_api: int = 20):
         """
         Add text to history
         """
-        history = history + [(f"User provided abstract: \n {text}", None)]
+        history = (history or []) + [{"role": "user", "content": f"User provided abstract: \n {text}"}]
         # print("All textboxes:", plan_textbox, base_paper_textbox, keyword_textbox)
+        no_state = None
+        try:
+            start, end, date_filter = parse_date_range(start_date, end_date)
+        except ValueError as e:
+            history = history + [{"role": "assistant", "content": str(e)}]
+            return history, text, "No papers found", no_state, plan_textbox, base_paper_textbox, keyword_textbox
+        date_note = describe_date_range(start, end)
         try: 
             if base_paper_textbox:
                 hist_response = f"Finding recommendations from S2 API based on the paper \n {base_paper_textbox}"
-                papers = get_recommendations_from_semantic_scholar(base_paper_textbox, num_papers_api)
+                papers = get_recommendations_from_semantic_scholar(base_paper_textbox, num_papers_api, start, end)
             else:
                 if keyword_textbox:
                     query = keyword_textbox
@@ -350,21 +430,27 @@ class GradioChatApp:
                     query = run_open_ai_api(json_data, model_name=model_name, max_tokens=max_tokens, temperature=temperature)
                 # print(query)
                 hist_response = f"LLM summarized keyword query to be used for S2 API: \n {query}"
-                papers = find_basis_paper(query, num_papers_api)
-        except:
-            history = history + [("No papers found using S2. Try providing keywords or a seed paper!", None)]
-            return history, "", "No papers found", "", "", "", ""
+                papers = find_basis_paper(query, num_papers_api, date_filter)
+            if date_note:
+                hist_response += f"\n\nDate range filter: {date_note}"
+        except Exception as e:
+            print(f"Search failed: {e}")
+            history = history + [{"role": "assistant", "content": "No papers found using S2. Try providing keywords or a seed paper!"}]
+            return history, text, "No papers found", no_state, plan_textbox, base_paper_textbox, keyword_textbox
         if not papers:
-            history = history + [("No papers found using S2. Try providing keywords or changing seed paper!", None)]
-            return history, "", "No papers found", "", "", "", ""
-        history = history + [(hist_response, None)]
+            msg = "No papers found using S2. Try providing keywords or changing seed paper!"
+            if date_note:
+                msg += f" (Date range filter: {date_note} - try widening it.)"
+            history = history + [{"role": "assistant", "content": msg}]
+            return history, text, "No papers found", no_state, plan_textbox, base_paper_textbox, keyword_textbox
+        history = history + [{"role": "assistant", "content": hist_response}]
         # print(rerank, sort_by)
         try:
-            papers = check_matching_paper(self.wer, text, papers)
-        except:
+            papers = check_matching_paper(text, papers)
+        except Exception:
             print("WER failed")
         papers = sort_papers(papers, sort_by)
-        display_markdown, cite_text = get_markdown_query_text(papers)
+        display_markdown, cite_text = get_markdown_query_text(papers, date_note)
         if rerank == "True":
             # print(f"{self.role_template}{self.ranking_prompt}")
             try:
@@ -374,9 +460,11 @@ class GradioChatApp:
                 # print(response)
                 # [1] > [2] > [4] > [3] > [6] > [5]
                 new_order = [int(s) for s in re.findall(r'\d+', response)]    
-                # print(new_order)        
+                # Keep valid, unique indices; append anything the LLM left out
+                new_order = list(dict.fromkeys(i for i in new_order if 1 <= i <= len(papers)))
+                new_order += [i for i in range(1, len(papers) + 1) if i not in new_order]
                 papers = [papers[i-1] for i in new_order]
-            except:
+            except Exception:
                 print("LLM not able to rerank!")
 
         # If paper based on seed paper, insert it at 0th index
@@ -384,48 +472,54 @@ class GradioChatApp:
             try:
                 base_paper_data = get_paper_data(paper_url=base_paper_textbox)
                 papers.insert(0,base_paper_data)
-            except:
+            except Exception:
                 print("Cant retrieve data for base paper!")
         papers = papers[:num_papers]
-        display_markdown, cite_text = get_markdown_query_text(papers)
+        display_markdown, cite_text = get_markdown_query_text(papers, date_note)
+        state = {"abstract": text, "cite_text": cite_text}
         
-        return history, text, display_markdown, cite_text, "", "", ""
+        return history, text, display_markdown, state, plan_textbox, base_paper_textbox, keyword_textbox
 
-    def bot(self, history, cite_text, request: gr.Request, model_name="gpt-4", temperature = 0.2, max_tokens = 300, regenerate: bool = False):
+    def bot(self, history, state, plan_textbox="", model_name="gpt-4", temperature = 0.2, max_tokens = 300,
+            regenerate: bool = False, request: gr.Request = None):
         """
         Calls the openai api
         """
         # Cache headers, ip address
         if request:
-            print("Request headers dictionary:", request.headers)
             print("IP address:", request.client.host)
+        if not state:
+            # Retrieval failed or nothing searched yet
+            yield history
+            return
+        text, cite_text = state["abstract"], state["cite_text"]
 
+        if regenerate and history and history[-1]["role"] == "assistant":
+            history = history[:-1]
         if plan_textbox:
             complete_prompt = format_prompt(base_prompt=self.plan_prompt, abstract=text, cite_text=cite_text, plan=plan_textbox)
-            history = history + [(f"Using plan: \n {plan_textbox}", None)]
+            history = history + [{"role": "assistant", "content": f"Using plan: \n {plan_textbox}"}]
         else:
-            self.vanilla_prompt = self.vanilla_prompt.format(max_tokens=max_tokens)
-            print(self.vanilla_prompt)
-            complete_prompt = format_prompt(base_prompt=self.vanilla_prompt, abstract=text, cite_text=cite_text, plan="")
+            vanilla_prompt = self.vanilla_prompt.format(max_tokens=max_tokens)
+            complete_prompt = format_prompt(base_prompt=vanilla_prompt, abstract=text, cite_text=cite_text, plan="")
         # print(complete_prompt)
 
-
-        if regenerate=="True":
-            history.pop()
-        # print(complete_prompt)
         json_data = {"prompt": complete_prompt}
-        response = run_open_ai_api(json_data, model_name=model_name, max_tokens=max_tokens, temperature=temperature)
+        try:
+            response = run_open_ai_api(json_data, model_name=model_name, max_tokens=max_tokens, temperature=temperature)
+        except Exception as e:
+            response = f"LLM call failed: {e}"
 
-        history[-1][1] = ""
+        history = history + [{"role": "assistant", "content": ""}]
         for character in response:
-            history[-1][1] += str(character)
+            history[-1]["content"] += str(character)
             time.sleep(0.005)
             yield history
-        # history[-1][1] = response
-        # time.sleep(1)
-        # yield history
 
-    def launch_app(self):
+    def regenerate(self, history, state, plan_textbox="", model_name="gpt-4", temperature=0.2, max_tokens=300):
+        yield from self.bot(history, state, plan_textbox, model_name, temperature, max_tokens, regenerate=True)
+
+    def launch_app(self, host="127.0.0.1", port=None, share=False, debug=False):
         """
         Gradio app defined here
         """
@@ -435,6 +529,8 @@ class GradioChatApp:
         plan_textbox = gr.Textbox(show_label=False, placeholder="Enter sentence plan (Default none). Example: Cite [1] on line 2.", container=False)
         base_paper_textbox = gr.Textbox(show_label=False, placeholder="Provide link of most relevant paper", container=False)
         keyword_textbox = gr.Textbox(show_label=False, placeholder="Enter optional keywords for querying (Default none)", container=False)
+        start_date = gr.Textbox(label="From date", placeholder="YYYY, YYYY-MM or YYYY-MM-DD (optional)")
+        end_date = gr.Textbox(label="To date", placeholder="YYYY, YYYY-MM or YYYY-MM-DD (optional)")
 
         with gr.Blocks(title="Writing Assistant", theme=gr.themes.Default(), css=block_css) as demo:
             prompt = gr.State()
@@ -454,6 +550,9 @@ class GradioChatApp:
                     * You provide keywords that could be used as a search query
                     * Provide a seed paper used for recommendation
 
+                    Optionally, restrict the search to papers published within a custom date range (From / To).
+                    Either end can be left blank for an open-ended range.
+
                     For generation, you could also provide a sentence plan to the LLM which contains the number of sentences and citations to produce
                     """
                 )
@@ -462,19 +561,22 @@ class GradioChatApp:
                 with gr.Column(scale=3):
                     with gr.Accordion("Ranking Parameters", open=False) as parameter_row:
                         # https://platform.openai.com/docs/models/overview
-                        model_name = gr.Dropdown(["gpt-3.5-turbo", "gpt-4", "gpt-4-32k", "gpt-4-1106-preview"], value="gpt-4", interactive=True,  label="Model") # scale=1, min_width=0
+                        model_name = gr.Dropdown(["gpt-3.5-turbo", "gpt-4", "gpt-4-32k", "gpt-4-1106-preview", "gpt-4o", "gpt-4o-mini"], value="gpt-4", interactive=True,  label="Model") # scale=1, min_width=0
                         num_papers = gr.Slider(minimum=1, maximum=10, value=4, step=1, interactive=True, label="Cite # papers")
                         sort_by = gr.Dropdown(["Relevance", "Citations", "Year"], value="Relevance", interactive=True,  label="Sort by") # scale=1, min_width=0
                         llm_rerank = gr.Radio(choices=["True", "False"], value="True", interactive=True, label="LLM Re-rank (May override sorting)")
                         with gr.Row():
                             temperature = gr.Slider(minimum=0.0, maximum=1.0, value=0.2, step=0.1, interactive=True, label="Temperature", scale=1)
                             max_tokens = gr.Slider(minimum=0, maximum=1024, value=500, step=64, interactive=True, label="Max output tokens", scale=2)
+                    with gr.Accordion("Date Range Filter", open=True):
+                        start_date.render()
+                        end_date.render()
                     display_1 = gr.Markdown(value=f"Retrieved papers", label="Retrieved papers!", elem_id="display_mrkdwn") #, visible=True)
                     # with gr.Accordion("Generation Parameters", open=False) as parameter_row:
                         # top_p = gr.Slider(minimum=0.0, maximum=1.0, value=0.7, step=0.1, interactive=True, label="Top P")
 
                 with gr.Column(scale=8):
-                    chatbot = gr.Chatbot(elem_id="Chatbot", label="ReviewGPT", height=480)
+                    chatbot = gr.Chatbot(elem_id="Chatbot", label="ReviewGPT", height=480, type="messages")
 
             with gr.Row():
                 with gr.Column(scale=3):
@@ -492,6 +594,9 @@ class GradioChatApp:
                         gr.Examples(label="Example: Sentence plan (Optional)", examples=[
                             [self.sample_plan],
                         ], inputs=[plan_textbox])
+                        gr.Examples(label="Example: Date range (Optional)", examples=[
+                            ["2020-01-01", "2023-12-31"],
+                        ], inputs=[start_date, end_date])
 
                 with gr.Column(scale=8):
 
@@ -528,58 +633,49 @@ class GradioChatApp:
 
             btn_list = [regenerate_btn, clear_btn]
 
+            search_inputs = [chatbot, textbox, plan_textbox, base_paper_textbox, keyword_textbox, llm_rerank, num_papers,
+                             model_name, sort_by, temperature, max_tokens, start_date, end_date]
+            search_outputs = [chatbot, textbox, display_1, prompt, plan_textbox, base_paper_textbox, keyword_textbox]
+            gen_inputs = [chatbot, prompt, plan_textbox, model_name, temperature, max_tokens]
+
             textbox.submit(
-                self.add_text,
-                [chatbot, textbox, prompt, plan_textbox, base_paper_textbox, keyword_textbox, llm_rerank, num_papers, model_name, sort_by, temperature, max_tokens],
-                [chatbot, textbox, display_1, prompt, plan_textbox, base_paper_textbox, keyword_textbox],
-                queue=False
+                self.add_text, search_inputs, search_outputs, queue=False
             ).then(
-                self.bot,
-                [chatbot, prompt, model_name, temperature, max_tokens],
-                [chatbot]
+                self.bot, gen_inputs, [chatbot]
             )
 
             submit_btn.click(
-                self.add_text,
-                [chatbot, textbox, prompt, plan_textbox, base_paper_textbox, keyword_textbox, llm_rerank, num_papers, model_name, sort_by, temperature, max_tokens],
-                [chatbot, textbox, display_1, prompt, plan_textbox, base_paper_textbox, keyword_textbox],
-                queue=False
+                self.add_text, search_inputs, search_outputs, queue=False
             ).then(
-                self.bot,
-                [chatbot, prompt, model_name, temperature, max_tokens],
-                [chatbot]
+                self.bot, gen_inputs, [chatbot]
             )
+
+            # Generate again for the already retrieved papers, using the sentence plan
+            plan_generate_btn.click(self.bot, gen_inputs, [chatbot])
 
             upvote_btn.click(upvote_last_response, prompt, [textbox], queue=False)
             downvote_btn.click(downvote_last_response, prompt, [textbox], queue=False)
 
 
-            regenerate_btn.click(self.bot,
-                [chatbot, prompt, model_name, temperature, max_tokens],
-                [chatbot])
+            regenerate_btn.click(self.regenerate, gen_inputs, [chatbot])
             # # state can also be cached  https://github.com/gradio-app/gradio/issues/730
             # txt.submit(self.add_text, [chatbot, txt], [chatbot, txt]).then(
             #     self.bot, chatbot, chatbot
             # )
-            clear_btn.click(lambda: None, None, chatbot, queue=False)
+            clear_btn.click(lambda: ([], None), None, [chatbot, prompt], queue=False)
 
-        demo.launch(allowed_paths=["resources/"])
+        demo.queue().launch(server_name=host, server_port=port, share=share, debug=debug,
+                            allowed_paths=[str(CUR_DIR / "resources")])
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Use 0.0.0.0 to expose on your network")
     parser.add_argument("--debug", action="store_true", help="using debug mode")
-    parser.add_argument("--port", type=int)
-    parser.add_argument("--concurrency-count", type=int, default=1)
-
-
-    # demo = build_demo()
-    # demo.queue(concurrency_count=args.concurrency_count, 
-    #            status_update_rate=10, api_open=False).launch(server_name=args.host, 
-    #            debug=args.debug, server_port=args.port, share=False)
-
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--share", action="store_true", help="Create a public gradio.live link (use this in Google Colab)")
+    args = parser.parse_args()
 
     test_app = GradioChatApp()
-    test_app.launch_app()
+    test_app.launch_app(host=args.host, port=args.port, share=args.share, debug=args.debug)

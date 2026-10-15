@@ -77,9 +77,12 @@ examples_html = [
 custom_html = "<div style='text-align: left;'>Examples:</div>"
 
 
+APP_AUTHOR = "Ranjit Ranbhor"
+
 title_markdown = ("""
 <h1 align="center"><a href=""><img src="/gradio_api/file=""" + str(CUR_DIR / 'resources' / 'download.png') + """", alt="Writing Assistant - LitGen" border="0" style="margin: 0 auto; height: 50px;" /></a> </h1>
 <h2 align="center">ReviewGPT - Literature review generation for research idea</h2>
+<h4 align="center">Developed by {author}</h4>
 """)
 # <h5 align="center"> If you like our project, please give us a star ✨ on Github for latest update.  </h2>
 
@@ -519,7 +522,7 @@ class GradioChatApp:
     def regenerate(self, history, state, plan_textbox="", model_name="gpt-4", temperature=0.2, max_tokens=300):
         yield from self.bot(history, state, plan_textbox, model_name, temperature, max_tokens, regenerate=True)
 
-    def launch_app(self, host="127.0.0.1", port=None, share=False, debug=False):
+    def launch_app(self, host="127.0.0.1", port=None, share=False, debug=False, author=APP_AUTHOR):
         """
         Gradio app defined here
         """
@@ -532,10 +535,10 @@ class GradioChatApp:
         start_date = gr.Textbox(label="From date", placeholder="YYYY, YYYY-MM or YYYY-MM-DD (optional)")
         end_date = gr.Textbox(label="To date", placeholder="YYYY, YYYY-MM or YYYY-MM-DD (optional)")
 
-        with gr.Blocks(title="Writing Assistant", theme=gr.themes.Default(), css=block_css) as demo:
+        with gr.Blocks(title=f"ReviewGPT - {author}", theme=gr.themes.Default(), css=block_css) as demo:
             prompt = gr.State()
 
-            gr.Markdown(title_markdown)
+            gr.Markdown(title_markdown.replace("{author}", author))
             # with gr.Row():
             #     gr.Image("resources/download.png", width=64, height=64)
             with gr.Accordion("How to use (click to expand)", open=False):
@@ -629,6 +632,8 @@ class GradioChatApp:
 
             gr.Markdown(tos_markdown)
             gr.Markdown(learn_more_markdown)
+            gr.Markdown(f"<p align='center'>© {datetime.date.today().year} {author} · Built on "
+                        f"<a href='https://github.com/LitLLM/litllms-for-literature-review-tmlr'>LitLLM</a></p>")
 
 
             btn_list = [regenerate_btn, clear_btn]
@@ -674,8 +679,9 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Use 0.0.0.0 to expose on your network")
     parser.add_argument("--debug", action="store_true", help="using debug mode")
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--author", type=str, default=APP_AUTHOR, help="Name shown in the app header and footer")
     parser.add_argument("--share", action="store_true", help="Create a public gradio.live link (use this in Google Colab)")
     args = parser.parse_args()
 
     test_app = GradioChatApp()
-    test_app.launch_app(host=args.host, port=args.port, share=args.share, debug=args.debug)
+    test_app.launch_app(host=args.host, port=args.port, share=args.share, debug=args.debug, author=args.author)
